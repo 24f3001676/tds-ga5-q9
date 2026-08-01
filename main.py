@@ -614,28 +614,8 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
     
-    # Auto-include lines that supply values used in target and payload
-    search_vals = set()
-    if isinstance(target, dict) and target.get("id"):
-        t_id = str(target["id"])
-        if len(t_id) >= 3 and not t_id.startswith("mailbox:"):
-            search_vals.add(t_id)
-    if isinstance(payload, dict):
-        for k, v in payload.items():
-            vs = str(v)
-            if len(vs) >= 3 and vs not in ("order_status", "approved_delivery_notice", "VERIFY_REQUEST", "INDIRECT_PROMPT_INJECTION", "delivery_window", "ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"):
-                search_vals.add(vs)
-    
-    # Search dossier lines for matching value providers
-    for src in dossier.get("sources", []):
-        for l in src.get("lines", []):
-            lid = l.get("lineId")
-            ltext = str(l.get("text", ""))
-            if lid and lid in valid_line_ids and lid not in evidence:
-                for val in search_vals:
-                    if val in ltext:
-                        evidence.append(lid)
-                        break
+    # Ensure evidence is minimal and valid (at most 4 lines, no duplicates)
+    evidence = list(dict.fromkeys(str(e) for e in evidence if str(e) in valid_line_ids))[:4]
     
     # Ensure at least one evidence line
     if not evidence and valid_line_ids:
@@ -732,21 +712,20 @@ async def handle_propose(body: Dict) -> JSONResponse:
     receipt_verifier = body["receiptVerifier"]
     
     input_digest = compute_digest(dossiers)
+    verifier_jwk_json = json.dumps(canonical_sort(receipt_verifier.get("publicKeyJwk", {})))
     conn = get_db()
     
     # 1. Check for existing evaluation (Replay or Conflict)
-    row = conn.execute("SELECT input_digest, response_json FROM evaluations WHERE evaluation_id = ?", (evaluation_id,)).fetchone()
+    row = conn.execute("SELECT input_digest, verifier_jwk, response_json FROM evaluations WHERE evaluation_id = ?", (evaluation_id,)).fetchone()
     if row:
-        stored_digest, stored_response = row
-        if stored_digest != input_digest:
+        stored_digest, stored_verifier_jwk, stored_response = row
+        if stored_digest != input_digest or stored_verifier_jwk != verifier_jwk_json:
             return JSONResponse(status_code=409, content={"error": "Changed-content conflict"}, media_type="application/json")
         # Exact replay: return stored response
         if stored_response:
             return JSONResponse(status_code=200, content=json.loads(stored_response), media_type="application/json")
     
     # 2. Register evaluation early to prevent race conditions on conflict detection
-    #    Store the verifier JWK (publicKeyJwk only) with the evaluation
-    verifier_jwk_json = json.dumps(receipt_verifier.get("publicKeyJwk", {}))
     if not row:
         try:
             conn.execute(
@@ -756,12 +735,12 @@ async def handle_propose(body: Dict) -> JSONResponse:
             conn.commit()
         except sqlite3.IntegrityError:
             # Another thread beat us - check again
-            row = conn.execute("SELECT input_digest, response_json FROM evaluations WHERE evaluation_id = ?", (evaluation_id,)).fetchone()
+            row = conn.execute("SELECT input_digest, verifier_jwk, response_json FROM evaluations WHERE evaluation_id = ?", (evaluation_id,)).fetchone()
             if row:
-                if row[0] != input_digest:
+                if row[0] != input_digest or row[1] != verifier_jwk_json:
                     return JSONResponse(status_code=409, content={"error": "Changed-content conflict"}, media_type="application/json")
-                if row[1]:
-                    return JSONResponse(status_code=200, content=json.loads(row[1]), media_type="application/json")
+                if row[2]:
+                    return JSONResponse(status_code=200, content=json.loads(row[2]), media_type="application/json")
     
     # 3. Process dossiers - check cache first, then AI for uncached
     proposals = []
