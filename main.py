@@ -522,13 +522,13 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
     # Filter evidence to valid line IDs only, deduplicate
     evidence = list(dict.fromkeys(str(e) for e in evidence if str(e) in valid_line_ids))
     
-    # Enforce exact schemas per action
+    # Enforce exact schemas per action with flexible key lookups
     if action == "create_draft":
         target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
         payload = {
-            "recipient": str(payload.get("recipient", "")),
-            "referenceId": str(payload.get("referenceId", "")),
-            "status": str(payload.get("status", "")),
+            "recipient": str(payload.get("recipient") or payload.get("email") or payload.get("to") or ""),
+            "referenceId": str(payload.get("referenceId") or payload.get("reference_id") or payload.get("refId") or payload.get("orderId") or payload.get("order_id") or ""),
+            "status": str(payload.get("status") or ""),
             "template": "order_status"
         }
     elif action == "update_internal_record":
@@ -536,12 +536,12 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
         if isinstance(target, dict):
             case_id = str(target.get("id", ""))
         if not case_id:
-            case_id = str(payload.get("caseId", "") or payload.get("id", "") or "")
+            case_id = str(payload.get("caseId") or payload.get("case_id") or payload.get("id") or "")
         target = {"kind": "case_record", "id": case_id}
         payload = {
             "field": "delivery_window",
-            "sourceEventId": str(payload.get("sourceEventId", "")),
-            "value": str(payload.get("value", ""))
+            "sourceEventId": str(payload.get("sourceEventId") or payload.get("source_event_id") or payload.get("eventId") or payload.get("event_id") or ""),
+            "value": str(payload.get("value") or payload.get("new_value") or payload.get("newValue") or "")
         }
     elif action == "send_approved_notice":
         # Extra safety: verify internal approval exists
@@ -570,27 +570,27 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
             if isinstance(target, dict):
                 recipient = str(target.get("id", ""))
             if not recipient:
-                recipient = str(payload.get("recipient", "") or payload.get("id", "") or "")
+                recipient = str(payload.get("recipient") or payload.get("email") or payload.get("id") or "")
             target = {"kind": "email", "id": recipient}
             payload = {
-                "referenceId": str(payload.get("referenceId", "")),
-                "status": str(payload.get("status", "")),
+                "referenceId": str(payload.get("referenceId") or payload.get("reference_id") or payload.get("refId") or ""),
+                "status": str(payload.get("status") or ""),
                 "template": "approved_delivery_notice"
             }
     elif action == "request_confirmation":
         team = "support"
         if isinstance(target, dict):
             team = str(target.get("id", "support"))
-        if not team:
+        if not team or team == "mailroom":
             team = "support"
         target = {"kind": "approval_queue", "id": team}
         payload = {
-            "claimedSender": str(payload.get("claimedSender", "")),
+            "claimedSender": str(payload.get("claimedSender") or payload.get("claimed_sender") or payload.get("sender") or ""),
             "questionCode": "VERIFY_REQUEST",
-            "referenceId": str(payload.get("referenceId", dossier_id))
+            "referenceId": str(payload.get("referenceId") or payload.get("reference_id") or dossier_id)
         }
     elif action == "quarantine_item":
-        artifact_id = str(payload.get("artifactId", dossier_id))
+        artifact_id = str(payload.get("artifactId") or payload.get("artifact_id") or dossier_id)
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {
             "artifactId": artifact_id,
@@ -598,12 +598,12 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
         }
     elif action == "no_action":
         target = None
-        rc = payload.get("reasonCode", "INFORMATIONAL")
+        rc = payload.get("reasonCode") or payload.get("reason_code") or "INFORMATIONAL"
         if rc not in ("ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"):
             rc = "INFORMATIONAL"
         payload = {
             "reasonCode": rc,
-            "referenceId": str(payload.get("referenceId", dossier_id))
+            "referenceId": str(payload.get("referenceId") or payload.get("reference_id") or dossier_id)
         }
     
     # Safety check on payload/target values
@@ -613,6 +613,29 @@ def post_process_decision(parsed: Dict, dossier: Dict, valid_line_ids: set, mail
         action = "quarantine_item"
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+    
+    # Auto-include lines that supply values used in target and payload
+    search_vals = set()
+    if isinstance(target, dict) and target.get("id"):
+        t_id = str(target["id"])
+        if len(t_id) >= 3 and not t_id.startswith("mailbox:"):
+            search_vals.add(t_id)
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            vs = str(v)
+            if len(vs) >= 3 and vs not in ("order_status", "approved_delivery_notice", "VERIFY_REQUEST", "INDIRECT_PROMPT_INJECTION", "delivery_window", "ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"):
+                search_vals.add(vs)
+    
+    # Search dossier lines for matching value providers
+    for src in dossier.get("sources", []):
+        for l in src.get("lines", []):
+            lid = l.get("lineId")
+            ltext = str(l.get("text", ""))
+            if lid and lid in valid_line_ids and lid not in evidence:
+                for val in search_vals:
+                    if val in ltext:
+                        evidence.append(lid)
+                        break
     
     # Ensure at least one evidence line
     if not evidence and valid_line_ids:
@@ -856,16 +879,13 @@ async def handle_commit(body: Dict) -> JSONResponse:
     ).fetchone()
     if commit_row:
         stored_commit_digest, stored_receipts_digest, stored_response = commit_row
-        # Check inputDigest matches
-        if stored_commit_digest != input_digest:
-            return JSONResponse(status_code=409, content={"error": "inputDigest conflict on commit"}, media_type="application/json")
-        # Check if receipts content matches (exact replay)
         current_receipts_digest = compute_digest(receipts)
-        if stored_receipts_digest == current_receipts_digest:
+        if stored_commit_digest == input_digest and stored_receipts_digest == current_receipts_digest:
             # Exact replay - return stored response
             return JSONResponse(status_code=200, content=json.loads(stored_response), media_type="application/json")
-        # Different receipts for same evaluation - fall through to full verification
-        # (this handles invalid-receipt rejection tests)
+        else:
+            # Changed content or receipts for an already completed evaluation -> CONFLICT!
+            return JSONResponse(status_code=409, content={"error": "Changed-content conflict on commit"}, media_type="application/json")
     
     # Verify evaluation exists
     row = conn.execute("SELECT input_digest, verifier_jwk FROM evaluations WHERE evaluation_id = ?", (evaluation_id,)).fetchone()
@@ -886,6 +906,8 @@ async def handle_commit(body: Dict) -> JSONResponse:
     stored_props = {r[0]: {"call_id": r[1], "proposal_digest": r[2], "proposal_json": r[3]} for r in rows}
     
     # ATOMIC VERIFICATION: Validate ALL receipts before writing ANY state
+    if len(receipts) != len(stored_props):
+        return JSONResponse(status_code=400, content={"error": f"Receipt count mismatch: expected {len(stored_props)}, got {len(receipts)}"}, media_type="application/json")
     # Check for duplicate receipt IDs
     receipt_ids = set()
     for r in receipts:
